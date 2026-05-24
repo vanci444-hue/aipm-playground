@@ -10,9 +10,9 @@ const demos = [
   },
   {
     path: './sampling/',
-    title: 'Top-K 与 Top-P 采样',
-    en: 'Top-K / Top-P Sampling',
-    desc: '调整 Top-K 和 Top-P 滑块，实时看模型从概率分布里"砍掉"哪些词、保留哪些词。理解搭工作流为什么要调这俩参数。',
+    title: 'Temperature 与 Top-P 采样',
+    en: 'Temperature / Top-P Sampling',
+    desc: '调整 Temperature 和 Top-P 滑块，实时看分布怎么被"软化/锐化"、哪些词被砍掉。理解搭工作流为什么要调这俩参数。',
     tags: ['采样参数', '工作流', 'LLM'],
     emoji: '🎲'
   }

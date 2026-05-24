@@ -1,8 +1,8 @@
 <script setup>
 import { ref, computed } from 'vue'
 
-// 预设：模型对 "中国的首都是" 之后下一个词的概率分布
-const tokens = [
+// 预设：模型对 "中国的首都是" 之后下一个词的原始概率分布（T=1 时）
+const baseTokens = [
   { word: '北京', prob: 0.65 },
   { word: '上海', prob: 0.18 },
   { word: '成都', prob: 0.06 },
@@ -15,38 +15,63 @@ const tokens = [
   { word: '长沙', prob: 0.002 }
 ]
 
-const topK = ref(tokens.length)   // 默认不截断
-const topP = ref(1.0)             // 默认不截断
+const temperature = ref(1.0)
+const topP = ref(1.0)
 
-// 计算每个词的状态
+// Temperature 调整：softmax(logits / T)
+// T<<1 锐化分布（更确定），T>>1 软化分布（更发散）
+function applyTemperature(probs, T) {
+  if (T <= 0.05) {
+    // 边界：T→0 退化为 argmax（最大概率词概率=1，其他=0）
+    const maxIdx = probs.indexOf(Math.max(...probs))
+    return probs.map((_, i) => (i === maxIdx ? 1 : 0))
+  }
+  // log 把原始概率转回 logit
+  const logits = probs.map(p => Math.log(Math.max(p, 1e-10)))
+  const scaled = logits.map(l => l / T)
+  // 减去最大值避免溢出
+  const maxL = Math.max(...scaled)
+  const exps = scaled.map(l => Math.exp(l - maxL))
+  const sumExp = exps.reduce((s, e) => s + e, 0)
+  return exps.map(e => e / sumExp)
+}
+
+// 经过 Temperature 调整后的概率（保持原顺序，对应 baseTokens）
+const tempAdjusted = computed(() => {
+  const newProbs = applyTemperature(baseTokens.map(t => t.prob), temperature.value)
+  return baseTokens.map((t, i) => ({
+    ...t,
+    origProb: t.prob,
+    adjustedProb: newProbs[i]
+  }))
+})
+
+// 按调整后概率降序排序，并应用 Top-P 截断
 const annotated = computed(() => {
-  // 按概率降序（已排序，但保险起见）
-  const sorted = [...tokens].sort((a, b) => b.prob - a.prob)
+  const sorted = [...tempAdjusted.value].sort((a, b) => b.adjustedProb - a.adjustedProb)
   let cumProb = 0
-  let topPCutoffIdx = sorted.length // 第一个不满足 Top-P 的索引
-  // Top-P 逻辑：从最大概率往下累加，直到累加值 >= top_p 为止；
-  // 后面的词全部砍掉。注意：累加超过的那个词本身仍然保留（因为是它使累加达标的）
+  let topPCutoffIdx = sorted.length
+  // Top-P：累加直到达到 P，包含第一个使累加达标的词
   for (let i = 0; i < sorted.length; i++) {
-    cumProb += sorted[i].prob
+    cumProb += sorted[i].adjustedProb
     if (cumProb >= topP.value) {
       topPCutoffIdx = i + 1
       break
     }
   }
-  // 边界：topP=1 时所有词都保留
   if (topP.value >= 0.9999) topPCutoffIdx = sorted.length
 
+  let runningSum = 0
   return sorted.map((t, i) => {
-    const cutByK = i >= topK.value
+    runningSum += t.adjustedProb
     const cutByP = i >= topPCutoffIdx
-    const kept = !cutByK && !cutByP
     return {
       ...t,
       rank: i + 1,
-      cutByK,
       cutByP,
-      kept,
-      cumProb: (i === 0 ? t.prob : (sorted.slice(0, i + 1).reduce((s, x) => s + x.prob, 0)))
+      kept: !cutByP,
+      cumProb: runningSum,
+      probChange: t.adjustedProb - t.origProb
     }
   })
 })
@@ -54,17 +79,11 @@ const annotated = computed(() => {
 // 候选词统计
 const stats = computed(() => {
   const kept = annotated.value.filter(t => t.kept)
-  const totalProb = kept.reduce((s, t) => s + t.prob, 0)
-  const cutByKOnly = annotated.value.filter(t => t.cutByK && !t.cutByP).length
-  const cutByPOnly = annotated.value.filter(t => t.cutByP && !t.cutByK).length
-  const cutByBoth = annotated.value.filter(t => t.cutByK && t.cutByP).length
+  const totalProb = kept.reduce((s, t) => s + t.adjustedProb, 0)
   return {
     keptCount: kept.length,
     totalProb,
-    cutByKOnly,
-    cutByPOnly,
-    cutByBoth,
-    totalCut: tokens.length - kept.length
+    cutCount: baseTokens.length - kept.length
   }
 })
 
@@ -74,11 +93,13 @@ const renormalized = computed(() => {
   if (total === 0) return []
   return annotated.value
     .filter(t => t.kept)
-    .map(t => ({ ...t, normProb: t.prob / total }))
+    .map(t => ({ ...t, normProb: t.adjustedProb / total }))
 })
 
 // 最大概率（用于柱状图宽度归一化）
-const maxProb = computed(() => Math.max(...tokens.map(t => t.prob)))
+const maxAdjustedProb = computed(() =>
+  Math.max(...annotated.value.map(t => t.adjustedProb))
+)
 
 // "模拟采样 100 次"
 const sampleResults = ref(null)
@@ -90,7 +111,6 @@ function runSampling() {
     return
   }
   sampling.value = true
-  // 简单动画：先清空，再延迟显示
   sampleResults.value = null
   setTimeout(() => {
     const counts = new Map()
@@ -113,34 +133,41 @@ function runSampling() {
   }, 200)
 }
 
-// 预设场景
+// 场景预设
 const scenarios = [
-  { label: '🔓 完全不截断', k: 10, p: 1.0 },
-  { label: '🎯 只看 Top-K=3', k: 3, p: 1.0 },
-  { label: '🎯 只看 Top-P=0.9', k: 10, p: 0.9 },
-  { label: '🔒 严格事实问答', k: 1, p: 1.0 },
-  { label: '⚖️ 业界推荐 Top-P=0.9 + K=10', k: 10, p: 0.9 }
+  { label: '🔓 默认（T=1, P=1）', t: 1.0, p: 1.0 },
+  { label: '🔒 严格事实问答（T=0）', t: 0, p: 1.0 },
+  { label: '⚖️ 业界推荐（T=0.7, P=0.9）', t: 0.7, p: 0.9 },
+  { label: '💡 创作发散（T=1.2, P=0.95）', t: 1.2, p: 0.95 },
+  { label: '🎨 极端发散（T=1.8）', t: 1.8, p: 1.0 }
 ]
 
 function applyScenario(s) {
-  topK.value = s.k
+  temperature.value = s.t
   topP.value = s.p
   sampleResults.value = null
+}
+
+// 帮助函数：格式化概率显示（小于 0.1% 显示为 <0.1%）
+function fmtProb(p) {
+  if (p < 0.001) return '<0.1%'
+  return (p * 100).toFixed(1) + '%'
 }
 </script>
 
 <template>
   <div class="page">
     <header class="page-header">
-      <h1>🎲 Top-K / Top-P 采样 · 交互演示</h1>
+      <h1>🎲 Temperature / Top-P 采样 · 交互演示</h1>
       <a class="home-link" href="../">← 回首页</a>
     </header>
 
     <p class="lead">
       LLM 每生成一个词，都是从词表的<b>概率分布</b>里"采样"一个词输出。
-      <b>Top-K</b> 和 <b>Top-P</b> 是控制"从哪些候选词里挑"的两个旋钮。
+      <b>Temperature</b> 调整分布的"软硬"，<b>Top-P</b> 截掉长尾的离谱词——
+      这是搭工作流（Coze / Dify / OpenAI API）时最常调的两个旋钮。
       <br />
-      <span class="muted">下面用一个真实场景（"中国的首都是"）演示两个旋钮怎么"砍候选词"。</span>
+      <span class="muted">下面用真实场景（"中国的首都是"）演示两个旋钮怎么影响输出。</span>
     </p>
 
     <!-- Prompt 展示 -->
@@ -154,15 +181,19 @@ function applyScenario(s) {
       <div class="control-card">
         <div class="control-header">
           <div>
-            <div class="control-title">Top-K</div>
-            <div class="control-desc">只保留概率最高的 <b>K</b> 个词，其他全砍</div>
+            <div class="control-title">Temperature</div>
+            <div class="control-desc">
+              <b>软化 / 锐化</b>整个概率分布
+              <br /><span class="muted">T=0 → 永远选最大；T 越大越发散</span>
+            </div>
           </div>
-          <div class="control-value">{{ topK }}</div>
+          <div class="control-value">{{ temperature.toFixed(2) }}</div>
         </div>
-        <input type="range" min="1" :max="tokens.length" step="1" v-model.number="topK" />
+        <input type="range" min="0" max="2" step="0.05" v-model.number="temperature" />
         <div class="control-scale">
-          <span>1（最严）</span>
-          <span>{{ tokens.length }}（不截断）</span>
+          <span>0（完全确定）</span>
+          <span>1（原始）</span>
+          <span>2（极端发散）</span>
         </div>
       </div>
 
@@ -170,7 +201,10 @@ function applyScenario(s) {
         <div class="control-header">
           <div>
             <div class="control-title">Top-P</div>
-            <div class="control-desc">从最高概率累加到 <b>P</b> 为止，后面全砍</div>
+            <div class="control-desc">
+              从最高概率<b>累加到 P 为止</b>，后面全砍
+              <br /><span class="muted">P=0.9 → 只从覆盖 90% 概率的候选里挑</span>
+            </div>
           </div>
           <div class="control-value">{{ topP.toFixed(2) }}</div>
         </div>
@@ -194,10 +228,9 @@ function applyScenario(s) {
     <div class="card chart-card">
       <h2>候选词概率分布</h2>
       <p class="muted">
-        <span class="badge badge-kept">保留</span> = 通过两道关；
-        <span class="badge badge-cut-k">Top-K 砍</span> 排名超出 K；
-        <span class="badge badge-cut-p">Top-P 砍</span> 累计概率超出 P；
-        <span class="badge badge-cut-both">两者都砍</span>
+        <span class="badge badge-kept">保留</span> 通过 Top-P；
+        <span class="badge badge-cut">被砍</span> 累计概率超出 P；
+        小箭头显示<b>概率被 Temperature 改变的方向</b>（↑ 锐化、↓ 软化）
       </p>
 
       <div class="bars">
@@ -207,24 +240,22 @@ function applyScenario(s) {
           <div class="bar-track">
             <div
               class="bar-fill"
-              :class="{
-                'kept': t.kept,
-                'cut-k': t.cutByK && !t.cutByP,
-                'cut-p': t.cutByP && !t.cutByK,
-                'cut-both': t.cutByK && t.cutByP
-              }"
-              :style="{ width: (t.prob / maxProb * 100) + '%' }"
+              :class="{ 'kept': t.kept, 'cut-p': t.cutByP }"
+              :style="{ width: (t.adjustedProb / Math.max(maxAdjustedProb, 0.001) * 100) + '%' }"
             >
-              <span class="bar-label">{{ (t.prob * 100).toFixed(1) }}%</span>
+              <span class="bar-label">{{ fmtProb(t.adjustedProb) }}</span>
             </div>
           </div>
-          <div class="bar-cum">累计 {{ (t.cumProb * 100).toFixed(1) }}%</div>
-          <div class="bar-status">
-            <span v-if="t.kept" class="status status-kept">✅ 保留</span>
-            <span v-else-if="t.cutByK && t.cutByP" class="status status-cut">❌ 双双被砍</span>
-            <span v-else-if="t.cutByK" class="status status-cut-k">❌ Top-K 砍</span>
-            <span v-else-if="t.cutByP" class="status status-cut-p">❌ Top-P 砍</span>
+          <div class="bar-change">
+            <span class="orig-prob">原 {{ fmtProb(t.origProb) }}</span>
+            <span v-if="Math.abs(t.probChange) > 0.001" class="change-arrow"
+                  :class="t.probChange > 0 ? 'up' : 'down'">
+              {{ t.probChange > 0 ? '↑' : '↓' }}
+              {{ (Math.abs(t.probChange) * 100).toFixed(1) }}%
+            </span>
+            <span v-else class="change-arrow same">不变</span>
           </div>
+          <div class="bar-cum">累计 {{ (t.cumProb * 100).toFixed(1) }}%</div>
         </div>
       </div>
 
@@ -232,19 +263,19 @@ function applyScenario(s) {
       <div class="stats">
         <div class="stat">
           <div class="stat-label">最终候选词数</div>
-          <div class="stat-val">{{ stats.keptCount }} / {{ tokens.length }}</div>
+          <div class="stat-val">{{ stats.keptCount }} / {{ baseTokens.length }}</div>
         </div>
         <div class="stat">
           <div class="stat-label">候选词覆盖概率</div>
           <div class="stat-val">{{ (stats.totalProb * 100).toFixed(1) }}%</div>
         </div>
         <div class="stat">
-          <div class="stat-label">Top-K 砍掉</div>
-          <div class="stat-val">{{ stats.cutByKOnly + stats.cutByBoth }} 个</div>
+          <div class="stat-label">Top-P 砍掉</div>
+          <div class="stat-val">{{ stats.cutCount }} 个</div>
         </div>
         <div class="stat">
-          <div class="stat-label">Top-P 砍掉</div>
-          <div class="stat-val">{{ stats.cutByPOnly + stats.cutByBoth }} 个</div>
+          <div class="stat-label">最大概率词</div>
+          <div class="stat-val">{{ annotated[0]?.word }} · {{ fmtProb(annotated[0]?.adjustedProb || 0) }}</div>
         </div>
       </div>
     </div>
@@ -254,7 +285,7 @@ function applyScenario(s) {
       <h2>模拟采样 100 次</h2>
       <p class="muted">
         基于上面候选词（重新归一化后的概率），随机采样 100 次，看实际会"挑"到哪些词。
-        <b>候选越少 → 输出越确定；候选越多 → 输出越多样。</b>
+        <b>T 越低 / P 越小 → 输出越确定；T 越高 / P 越大 → 输出越多样。</b>
       </p>
       <button @click="runSampling" :disabled="sampling || stats.keptCount === 0" class="run-btn">
         {{ sampling ? '采样中…' : '▶ 跑一次（100 次采样）' }}
@@ -270,7 +301,7 @@ function applyScenario(s) {
         </div>
       </div>
       <p v-if="stats.keptCount === 0" class="warn">
-        ⚠️ 当前 Top-K / Top-P 设置过严，无候选词可采样。
+        ⚠️ 当前设置过严，无候选词可采样。
       </p>
     </div>
 
@@ -279,17 +310,20 @@ function applyScenario(s) {
       <h2>PM 视角：工作流里怎么调？</h2>
       <table>
         <thead>
-          <tr><th>场景</th><th>建议</th></tr>
+          <tr><th>场景</th><th>Temperature</th><th>Top-P</th></tr>
         </thead>
         <tbody>
-          <tr><td>事实问答 / 信息抽取 / 代码</td><td><b>Top-K=1</b> 或 <b>Top-P=0.1</b>，强制确定性</td></tr>
-          <tr><td>标准客服 / 翻译 / 摘要</td><td>Top-P=0.9，业界默认</td></tr>
-          <tr><td>创作 / 改写 / 头脑风暴</td><td>Top-P=0.95 + Temperature 高（其他演示）</td></tr>
+          <tr><td>事实问答 / 信息抽取 / 代码</td><td><b>0 ~ 0.3</b></td><td>0.9</td></tr>
+          <tr><td>标准客服 / 翻译 / 摘要</td><td>0.3 ~ 0.5</td><td>0.9</td></tr>
+          <tr><td>创作 / 改写 / 头脑风暴</td><td>0.7 ~ 0.9</td><td>0.95</td></tr>
         </tbody>
       </table>
       <div class="pitfall">
-        <b>⚠️ 实操坑</b>：很多工作流平台 Top-K 和 Top-P 同时打开，
-        实际上<b>两个一起用会互相干扰</b>——业界惯例是<b>二选一</b>，固定其中一个、只调另一个。
+        <b>⚠️ 实操坑</b>：很多工作流平台 Temperature 默认 <b>0.7</b>——
+        跑事实类任务（RAG 问答、信息抽取）会出幻觉。<b>新建节点的第一件事就是把 Temperature 拉到 0 ~ 0.3。</b>
+      </div>
+      <div class="pitfall" style="margin-top: 0.6rem;">
+        <b>💡 业界惯例</b>：固定 Top-P=0.9，<b>只调 Temperature</b>——这俩同时大幅调整会互相干扰。
       </div>
     </div>
 
@@ -354,17 +388,20 @@ function applyScenario(s) {
   justify-content: space-between;
   align-items: flex-start;
   margin-bottom: 1rem;
+  gap: 0.75rem;
 }
 
 .control-title {
   font-size: 1.1rem;
   font-weight: 600;
-  margin-bottom: 0.2rem;
+  margin-bottom: 0.3rem;
 }
 .control-desc {
   font-size: 0.85rem;
-  color: var(--fg-muted);
+  color: var(--fg);
+  line-height: 1.5;
 }
+.control-desc .muted { font-size: 0.78rem; }
 
 .control-value {
   font-size: 1.8rem;
@@ -372,12 +409,13 @@ function applyScenario(s) {
   font-variant-numeric: tabular-nums;
   color: var(--accent);
   line-height: 1;
+  flex-shrink: 0;
 }
 
 .control-scale {
   display: flex;
   justify-content: space-between;
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   color: var(--fg-muted);
   margin-top: 0.4rem;
 }
@@ -424,9 +462,7 @@ function applyScenario(s) {
   margin: 0 0.15em;
 }
 .badge-kept { background: var(--success); color: #fff; }
-.badge-cut-k { background: var(--danger); color: #fff; }
-.badge-cut-p { background: var(--warning); color: #fff; }
-.badge-cut-both { background: var(--fg-muted); color: #fff; }
+.badge-cut { background: var(--warning); color: #fff; }
 
 .bars {
   display: flex;
@@ -437,7 +473,7 @@ function applyScenario(s) {
 
 .bar-row {
   display: grid;
-  grid-template-columns: 38px 60px 1fr 100px 110px;
+  grid-template-columns: 36px 60px 1fr 130px 100px;
   align-items: center;
   gap: 0.75rem;
   padding: 0.4rem 0;
@@ -474,12 +510,10 @@ function applyScenario(s) {
   align-items: center;
   padding: 0 0.5em;
   transition: width 0.3s ease, background 0.2s;
-  min-width: 3em;
+  min-width: 3.5em;
 }
 .bar-fill.kept { background: var(--success); }
-.bar-fill.cut-k { background: var(--danger); }
 .bar-fill.cut-p { background: var(--warning); }
-.bar-fill.cut-both { background: var(--fg-muted); }
 
 .bar-label {
   color: #fff;
@@ -488,23 +522,33 @@ function applyScenario(s) {
   font-variant-numeric: tabular-nums;
 }
 
+.bar-change {
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  align-items: flex-start;
+}
+.orig-prob {
+  color: var(--fg-muted);
+  font-size: 0.7rem;
+}
+.change-arrow {
+  font-weight: 600;
+  padding: 0.05em 0.4em;
+  border-radius: 3px;
+}
+.change-arrow.up { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+.change-arrow.down { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+.change-arrow.same { color: var(--fg-muted); font-weight: 400; }
+
 .bar-cum {
   font-size: 0.78rem;
   color: var(--fg-muted);
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
-
-.bar-status .status {
-  font-size: 0.78rem;
-  font-weight: 600;
-  padding: 0.15em 0.55em;
-  border-radius: 4px;
-}
-.status-kept { background: rgba(16, 185, 129, 0.15); color: var(--success); }
-.status-cut { background: var(--bg-subtle); color: var(--fg-muted); }
-.status-cut-k { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
-.status-cut-p { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
 
 .stats {
   display: grid;
@@ -613,6 +657,6 @@ function applyScenario(s) {
   .bar-row {
     grid-template-columns: 30px 50px 1fr 80px;
   }
-  .bar-status { display: none; }
+  .bar-change { display: none; }
 }
 </style>
